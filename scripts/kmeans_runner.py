@@ -1,4 +1,45 @@
 from utils import *
+import argparse 
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', type=str, default='iwildcam', help='Dataset name')
+parser.add_argument('--model', type=str, default="ERM", help="Model name to featurize dataset, not all models for a dataset, Default: ERM")
+parser.add_argument('--no_rng', action='store_true', help='Toggles fixed RNG generator for consistency, Default: True') 
+parser.add_argument('--cutoff', type=int, default=25, help='Cutoff for number of shots to test, Default: 25')
+sampling_algorithms_dict = {'iterative':'iterative_kmeans_sample_ind', 'weighted':'weighted_iterative_kmeans_sample_ind'}
+parser.add_argument('--sampler', type=str, choices=sampling_algorithms_dict.keys(), default='weighted', help='Sampling algorithms to select training data, Default: balanced')
+
+parser.add_argument('--features', type=str, help='Optional path to featurize data of the dataset/model specified')
+parser.add_argument('--classifier', type=str, help='Optional path to the original classifier of the dataset/model specified')
+parser.add_argument('--results', type=str, default='../results', help='Optional path to store accuracy results')
+
+config = parser.parse_args()
+
+if config.features is None:
+    config.features = f'/dccstor/hoo-misha-1/wilds/wilds/features/{config.dataset}/{config.model}'
+
+set_path_base(config.features)
+
+if config.classifier is None:
+    config.classifier = f'/dccstor/hoo-misha-1/wilds/WOODS/classifiers/{config.dataset}/{config.dataset}_{config.model}_classifier'
+
+if config.no_rng:
+    rng = np.random.default_rng(2022)
+    random_state = 0
+else:
+    rng = np.random.default_rng()
+    random_state = None
+set_random_state(rng, random_state)
+
+sampling_algorithm_name = sampling_algorithms_dict[config.sampler]
+sampling_algorithm = globals()[sampling_algorithm_name]
+
+print(f'Model: {config.model}')
+print(f'Features stored at: {config.features}')
+print(f'Original classifier stored at: {config.classifier}')
+print(f'Results stored at: {config.results}')
+print(f'Fixed RNG State: {config.no_rng}')
+print(f'Cutoff: {config.cutoff}')
 
 path_base = '/dccstor/hoo-misha-1/wilds/wilds/features/iwildcam/PseudoLabel'
 set_path_base(path_base)
@@ -21,9 +62,9 @@ for cam_id in cam_ids:
     cam_dict[cam_id] = []
     ba_cam_dict[cam_id] = []
     f1_cam_dict[cam_id] = []
-    orig_dict[cam_id] = get_original_accuracy(cam_id=[cam_id], cutoff=cutoff)
-    ba_orig_dict[cam_id] = get_balanced_original_accuracy(cam_id=[cam_id], cutoff=cutoff)
-    f1_orig_dict[cam_id] = get_original_f1_macro(cam_id=[cam_id], cutoff=cutoff)
+    orig_dict[cam_id] = get_original_accuracy(config.classifier,cam_id=[cam_id], cutoff=cutoff)
+    ba_orig_dict[cam_id] = get_balanced_original_accuracy(config.classifier,cam_id=[cam_id], cutoff=cutoff)
+    f1_orig_dict[cam_id] = get_original_f1_macro(config.classifier,cam_id=[cam_id], cutoff=cutoff)
     print(f'|   | {orig_dict[cam_id]}')
     f,l,m = cam_flm(1, [cam_id])
     f,l,m = prune_flm(f,l,m, cutoff)
@@ -32,7 +73,7 @@ for cam_id in cam_ids:
     # sampled_ind_full = kmeans_closest_classes_sample_ind(f,l,batch=cutoff)
     unique_classes = np.unique(l)
     num_classes = len(unique_classes)
-    batch_classes_centers, centers = kmeans_argmax_n_classes_sample_ind_helper(f,l)
+    batch_classes_centers, centers = iterative_kmeans_sample_ind_helper(f,l)
     
     batch_classes_center_labels = [-1]*len(batch_classes_centers)
     center_labels = [-1] * len(centers)
@@ -54,37 +95,44 @@ for cam_id in cam_ids:
         
     distances = {}
     
-    def get_dist(mu_m, mu_is):
+    def get_dist(mu_m, mu_is, mu_is_labels):
         sum_d = 0
-        for mu_i in mu_is:
+        
+        mu_is_labels_counts = np.unique(mu_is_labels, return_counts=True)
+        
+        mu_is_labels_count_dict = {}
+        for label_i in range(len(mu_is_labels_counts[0])):
+            label = mu_is_labels_counts[0][label_i]
+            counts = mu_is_labels_counts[1][label_i]
+            mu_is_labels_count_dict[label] = counts
+        
+        for mu_i_i in range(len(mu_is)):
+            mu_i = mu_is[mu_i_i]
+            mu_i_label = mu_is_labels[mu_i_i]    
+            mu_i_label_count = mu_is_labels_count_dict[mu_i_label]
+            
             if (tuple(mu_i), tuple(mu_m)) in distances or (tuple(mu_m), tuple(mu_i)) in distances:
                 sum_d += distances[(tuple(mu_i), tuple(mu_m))]
             else:
-                sum_d += np.linalg.norm(mu_m - mu_i)
-                distances[(tuple(mu_i), tuple(mu_m))] = np.linalg.norm(mu_m - mu_i)
-                distances[(tuple(mu_m), tuple(mu_i))] = np.linalg.norm(mu_m - mu_i)
+                sum_d += (1 - mu_i_label_count / len(mu_is)) * np.linalg.norm(mu_m - mu_i)
+                distances[(tuple(mu_i), tuple(mu_m))] = (1 - mu_i_label_count / len(mu_is)) * np.linalg.norm(mu_m - mu_i)
+                distances[(tuple(mu_m), tuple(mu_i))] = (1 - mu_i_label_count / len(mu_is)) * np.linalg.norm(mu_m - mu_i)
         return sum_d
     
     for batch in range(1,cutoff):
         # get sampled ind
-        shots_count = 0
+        shots_count = len(centers)
         while(shots_count < batch*num_classes):
+            #print(shots_count)
             max_dist = -1
             max_dist_i = None
             
-            center_labels_values, center_labels_counts = np.unique(center_labels, return_counts=True)
-            center_labels_values = list(center_labels_values)
-            
             for mu_m_i in range(len(batch_classes_centers)):
                 mu_m = batch_classes_centers[mu_m_i]
-                mu_m_label = batch_classes_center_labels[mu_m_i]
-
-                mu_m_label_count_i = center_labels_values.index(mu_m_label)
-                mu_m_label_count = center_labels_counts[mu_m_label_count_i]
                 
                 if mu_m in centers:
                     continue
-                mu_m_dist = (mu_m_label_count / len(center_labels) * get_dist(mu_m, centers)
+                mu_m_dist = get_dist(mu_m, centers, center_labels)
                 if mu_m_dist > max_dist:
                     max_dist = mu_m_dist
                     max_dist_i = mu_m_i
@@ -93,7 +141,9 @@ for cam_id in cam_ids:
             try:
                 centers = np.vstack((centers, batch_classes_centers[max_dist_i][np.newaxis,:]))
             except:
-                print(f'MESSED UP CENTERS { batch_classes_centers[max_dist_i][np.newaxis,:] }')
+                raise Exception(f'{centers.shape}, {batch_classes_centers[max_dist_i].shape}')
+                #centers = np.vstack((centers, np.squeeze(batch_classes_centers[max_dist_i])))
+            center_labels.append(batch_classes_center_labels[max_dist_i])
             shots_count += 1
 
         ret_ind = []  
@@ -160,20 +210,20 @@ for cam_id in cam_ids:
         f1_cam_dict[cam_id].append(f1_acc)
 import pickle
 
-with open('kmeans_argmax_weighted_n_classes_fast_cam_dict.pkl','wb') as file:
+with open('weighted_iterative_kmeans_cam_dict.pkl','wb') as file:
     pickle.dump(cam_dict, file)
     
-with open('kmeans_argmax_weighted_n_classes_fast_orig_dict.pkl','wb') as file:
+with open('weighted_iterative_kmeans_orig_dict.pkl','wb') as file:
     pickle.dump(orig_dict, file)
     
-with open('ba_kmeans_argmax_weighted_n_classes_fast_cam_dict.pkl','wb') as file:
+with open('weighted_iterative_kmeans_cam_dict.pkl','wb') as file:
     pickle.dump(ba_cam_dict, file)
     
-with open('ba_kmeans_argmax_weighted_n_classes_fast_orig_dict.pkl','wb') as file:
+with open('weighted_iterative_kmeans_orig_dict.pkl','wb') as file:
     pickle.dump(ba_orig_dict, file)
     
-with open('f1_kmeans_argmax_weighted_n_classes_fast_cam_dict.pkl','wb') as file:
+with open('weighted_iterative_kmeans_cam_dict.pkl','wb') as file:
     pickle.dump(f1_cam_dict, file)
     
-with open('f1_kmeans_argmax_weighted_n_classes_fast_orig_dict.pkl','wb') as file:
+with open('weighted_iterative_kmeans_orig_dict.pkl','wb') as file:
     pickle.dump(f1_orig_dict, file)
