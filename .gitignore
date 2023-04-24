@@ -131,3 +131,7 @@ dmypy.json
 # Pickle
 #*.pkl
 #**/*.pkl
+
+# Numpy
+*.npy
+**/*.npy
